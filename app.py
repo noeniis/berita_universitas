@@ -588,9 +588,7 @@ def analyze_text(
                 final_pred = 0
             
                 padanan = serapan_map.get(t)
-            
-                st.write("TOKEN:", t)
-                st.write("PADANAN:", padanan)
+
             
                 if padanan:
             
@@ -606,11 +604,68 @@ def analyze_text(
             else:
                 continue
 
+            # ==========================================================
+            # DEFAULT REKOMENDASI
+            # ==========================================================
+            
             recs = jw_res["top_k_recs"]
             catatan = ""
+            
+            # ==========================================================
+            # KATA INGGRIS
+            # ==========================================================
+            
             if status == "KATA_INGGRIS":
+            
+                flag = "KATA_INGGRIS"
+            
+                tipe = "Kata Bahasa Inggris"
+            
+                final_pred = 0
+            
+                catatan = (
+                    "Gunakan huruf miring jika kata tetap digunakan"
+                )
+            
+            # ==========================================================
+            # KATA SERAPAN
+            # ==========================================================
+            
+            elif status == "KATA_SERAPAN":
+            
+                flag = "KATA_SERAPAN"
+            
+                tipe = "Kata Asing dengan Padanan KBBI"
+            
+                final_pred = 0
+            
                 padanan = serapan_map.get(t)
-                catatan = f"Padanan KBBI: '{padanan}'" if padanan else "Gunakan huruf miring jika dipertahankan"
+            
+                if padanan:
+            
+                    # ==================================================
+                    # PAKSA REKOMENDASI MASUK
+                    # ==================================================
+            
+                    recs = [padanan]
+            
+                    catatan = (
+                        f"Disarankan menggunakan bentuk baku "
+                        f"bahasa Indonesia: '{padanan}'"
+                    )
+            
+            # ==========================================================
+            # TYPO / TIDAK BAKU
+            # ==========================================================
+            
+            elif final_pred == 1:
+            
+                flag = "TYPO"
+            
+                tipe = "Salah Ketik / Kata Tidak Baku"
+            
+            else:
+                continue
 
             results.append(
                 {
