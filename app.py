@@ -333,8 +333,8 @@ def load_lexicons():
             df_s.columns[-1],
         )
         for _, row in df_s.iterrows():
-            asal = normalize_token(str(row[col_asal]))
-            serapan = normalize_token(str(row[col_serapan]))
+            asal = normalize_token(row[col_asal])
+            serapan = normalize_token(row[col_serapan])
             if asal and serapan:
                 serapan_map[asal] = serapan
                 serapan_set.add(asal)
