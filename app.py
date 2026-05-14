@@ -438,7 +438,7 @@ def predict_jw(
     t = normalize_token(token)
     status = classify_token(t, kbbi_set, inggris_set, whitelist_set, serapan_set)
 
-    if status in ("WHITELIST_KHUSUS", "KBBI_VALID", "KATA_SERAPAN", "KOSONG", "KATA_INGGRIS"):
+    if status in ("WHITELIST_KHUSUS", "KATA_SERAPAN", "KOSONG", "KATA_INGGRIS"):
         return {
             "pred": 0,
             "max_sim": 1.0,
