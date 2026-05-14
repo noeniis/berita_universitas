@@ -714,7 +714,7 @@ def build_tooltip(row: dict) -> str:
     if flag == "TYPO":
         lines = [f"\u26a0\ufe0f \u201c{token}\u201d terdeteksi sebagai salah ketik"]
         if row.get("rekomendasi"):
-            top = row["rekomendasi"][:3]
+            top = row["rekomendasi"]
             lines.append("Saran pengganti: " + ", ".join(top))
         elif row.get("best_match"):
             lines.append(f"Kata yang paling mirip: {row['best_match']}")
@@ -937,7 +937,7 @@ if text_to_run:
             {
                 "Kata": r["token"],
                 "Jenis Temuan": FLAG_STYLES.get(r["flag"], {}).get("label", r["flag"]),
-                "Saran Perbaikan": ", ".join(r["rekomendasi"][:3]) if r["rekomendasi"] else "-",
+                "Saran Perbaikan": ", ".join(r["rekomendasi"]) if r["rekomendasi"] else "-",
                 "Keterangan": r["catatan"] or "-",
             }
             for r in results_display
