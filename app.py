@@ -585,15 +585,38 @@ def analyze_text(
                 final_pred = 0
             elif final_pred == 1:
                 flag = "TYPO"
-                tipe = "Typo"
+                tipe = "Salah Ketik / Kata Tidak Baku"
             else:
                 continue
 
             recs = jw_res["top_k_recs"]
             catatan = ""
+
             if status == "KATA_INGGRIS":
                 padanan = serapan_map.get(t)
-                catatan = f"Padanan KBBI: '{padanan}'" if padanan else "Gunakan huruf miring jika dipertahankan"
+            
+                # ==========================================================
+                # JIKA ADA PADANAN SERAPAN
+                # ==========================================================
+                if padanan:
+                    # rekomendasi utama = kata serapan Indonesia
+                    recs = [padanan]
+            
+                    catatan = (
+                        f"Kata asing terdeteksi. "
+                        f"Padanan KBBI yang disarankan: '{padanan}'"
+                    )
+            
+                # ==========================================================
+                # JIKA TIDAK ADA PADANAN
+                # ==========================================================
+                else:
+                    catatan = (
+                        "Kata asing tidak memiliki padanan "
+                        "pada daftar kata serapan. "
+                        "Gunakan huruf miring jika dipertahankan."
+                    )
+
 
             results.append(
                 {
@@ -640,23 +663,42 @@ def build_tooltip(row: dict) -> str:
     token = row["token"]
 
     if flag == "TYPO":
-        lines = [f"\u26a0\ufe0f \u201c{token}\u201d terdeteksi sebagai salah ketik"]
+        lines = [
+            f"\u26a0\ufe0f “{token}” terdeteksi sebagai "
+            f"salah ketik atau kata tidak baku"
+        ]
+    
         if row.get("rekomendasi"):
             top = row["rekomendasi"][:3]
-            lines.append("Saran pengganti: " + ", ".join(top))
+            lines.append("Saran perbaikan: " + ", ".join(top))
+    
         elif row.get("best_match"):
-            lines.append(f"Kata yang paling mirip: {row['best_match']}")
-        lines.append("\u2192 Periksa kembali ejaan kata ini")
+            lines.append(
+                f"Kata yang paling mirip: {row['best_match']}"
+            )
+    
+        lines.append("→ Periksa kembali penulisan kata ini")
 
     elif flag == "KATA_INGGRIS":
-        lines = [f"\U0001f310 \u201c{token}\u201d adalah kata berbahasa Inggris"]
-        catatan = row.get("catatan", "")
-        if catatan and "Padanan" in catatan:
-            padanan = catatan.replace("Padanan KBBI: ", "").strip("'")
-            lines.append(f"Padanan dalam bahasa Indonesia: {padanan}")
+
+        lines = [
+            f"\U0001f310 “{token}” terdeteksi sebagai "
+            f"kata asing/bahasa Inggris"
+        ]
+    
+        if row.get("rekomendasi"):
+            padanan = row["rekomendasi"][0]
+    
+            lines.append(
+                f"Padanan bahasa Indonesia yang disarankan: "
+                f"{padanan}"
+            )
+    
         else:
-            lines.append("Gunakan padanan bahasa Indonesia jika tersedia,")
-            lines.append("atau cetak miring jika tetap digunakan")
+            lines.append(
+                "Gunakan huruf miring jika kata tetap digunakan"
+            )
+
 
     elif flag == "KATA_SERAPAN":
         lines = [f"\U0001f4cc \u201c{token}\u201d adalah kata serapan dari bahasa asing"]
@@ -854,7 +896,11 @@ if text_to_run:
             {
                 "Kata": r["token"],
                 "Jenis Temuan": FLAG_STYLES.get(r["flag"], {}).get("label", r["flag"]),
-                "Saran Perbaikan": ", ".join(r["rekomendasi"][:3]) if r["rekomendasi"] else "-",
+               "Saran Perbaikan": (
+                    ", ".join(r["rekomendasi"][:3])
+                    if r["rekomendasi"]
+                    else "-"
+                ),
                 "Keterangan": r["catatan"] or "-",
             }
             for r in results_display
@@ -886,13 +932,18 @@ if text_to_run:
                         for rec in r["rekomendasi"]:
                             st.code(rec)
                     elif r["flag"] == "KATA_INGGRIS":
-                        st.markdown("**Saran:**")
-                        catatan = r.get("catatan", "")
-                        if catatan and "Padanan" in catatan:
-                            padanan = catatan.replace("Padanan KBBI: ", "").strip("'")
-                            st.code(padanan)
+
+                        st.markdown("**Rekomendasi Kata:**")
+                    
+                        if r["rekomendasi"]:
+                    
+                            for rec in r["rekomendasi"]:
+                                st.code(rec)
+                    
                         else:
-                            st.caption("Gunakan padanan bahasa Indonesia, atau cetak miring jika dipertahankan.")
+                            st.caption(
+                                "Gunakan huruf miring jika kata tetap dipertahankan."
+                            )
                     else:
                         st.caption("Pastikan penulisan kata ini sudah sesuai KBBI.")
 
