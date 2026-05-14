@@ -484,7 +484,7 @@ def predict_bert(kalimat: str, token: str, tokenizer, model, device) -> dict:
             token_type_ids=enc["token_type_ids"].to(device),
         )
     probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()[0]
-    pred = int(np.argmax(probs))
+    pred = 1 if probs[1] >= 0.75 else 0
     return {
         "pred": pred,
         "prob_correct": round(float(probs[0]), 4),
