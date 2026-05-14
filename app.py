@@ -591,6 +591,8 @@ def analyze_text(
                 # AMBIL PADANAN SERAPAN
                 # ==========================================
                 padanan = serapan_map.get(t)
+                print("TOKEN:", t)
+                print("PADANAN:", padanan)
             
                 if padanan:
             
