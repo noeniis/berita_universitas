@@ -580,19 +580,17 @@ def analyze_text(
                 tipe = "Kata Bahasa Inggris"
                 final_pred = 0
             elif status == "KATA_SERAPAN":
-            
+
                 flag = "KATA_SERAPAN"
             
                 tipe = "Kata Asing dengan Padanan KBBI"
             
                 final_pred = 0
             
-                # ==========================================
-                # AMBIL PADANAN SERAPAN
-                # ==========================================
                 padanan = serapan_map.get(t)
-                print("TOKEN:", t)
-                print("PADANAN:", padanan)
+            
+                st.write("TOKEN:", t)
+                st.write("PADANAN:", padanan)
             
                 if padanan:
             
