@@ -44,7 +44,6 @@ st.markdown(
 <style>
 html, body, [class*="css"] { font-family: Arial, sans-serif; }
 
-/* Kotak Putih untuk Teks Anotasi */
 .text-preview-box {
     background: #ffffff;
     border: 1px solid #e5e7eb;
@@ -69,7 +68,7 @@ html, body, [class*="css"] { font-family: Arial, sans-serif; }
 )
 
 # ==============================================================
-# UTILITAS TEKS & RESOURCES (Sama Seperti Sebelumnya)
+# UTILITAS TEKS
 # ==============================================================
 
 def normalize_unicode(text: str) -> str:
@@ -134,40 +133,58 @@ def load_model():
 
 @st.cache_resource(show_spinner=False)
 def load_lexicons():
+    # PERBAIKAN: Fungsi pembaca CSV yang lebih kuat
     def read_csv_safe(path):
-        try: return pd.read_csv(path, encoding="utf-8-sig")
-        except: return pd.read_csv(path, encoding="latin1")
+        for enc in ["utf-8-sig", "latin1", "cp1252"]:
+            try:
+                # sep=None & engine='python' untuk auto-detect separator (koma/tab/semicolon)
+                # on_bad_lines='skip' untuk mengabaikan baris yang korup/kolom berlebih
+                return pd.read_csv(path, encoding=enc, sep=None, engine='python', on_bad_lines='skip')
+            except:
+                continue
+        return pd.DataFrame()
 
     lex_dfs = {}
     keys = ["kbbi", "kata_inggris", "kata_serapan", "akronim", "daftar_lembaga", "daftar_nama_orang", "istilah_islam", "sample_correct_2025"]
     for key in keys:
         p = os.path.join(LEXICON_LOCAL, f"{key}.csv")
-        if not os.path.exists(p): gdown.download(id=DRIVE_IDS[key], output=p, quiet=True)
+        if not os.path.exists(p):
+            try:
+                gdown.download(id=DRIVE_IDS[key], output=p, quiet=True)
+            except:
+                pass
         lex_dfs[key] = read_csv_safe(p)
 
-    def to_set(df, col):
+    def to_set(df, col_hint):
         if df is None or df.empty: return set()
-        c = col if col in df.columns else df.columns[0]
+        # Cari kolom yang paling mendekati hint atau ambil kolom pertama
+        cols = [c for c in df.columns if col_hint.lower() in c.lower()]
+        c = cols[0] if cols else df.columns[0]
         return set(normalize_token(v) for v in df[c].dropna() if len(normalize_token(v)) >= 2)
 
     kbbi_set = to_set(lex_dfs["kbbi"], "kata")
     inggris_set = to_set(lex_dfs["kata_inggris"], "headword") - kbbi_set
+    
     whitelist_set = set()
     for k in ["akronim", "daftar_lembaga", "daftar_nama_orang", "istilah_islam", "sample_correct_2025"]:
-        whitelist_set.update(to_set(lex_dfs[k], lex_dfs[k].columns[0]))
+        whitelist_set.update(to_set(lex_dfs[k], ""))
 
     serapan_map, serapan_set = {}, set()
     df_s = lex_dfs["kata_serapan"]
-    col_asal = next(c for c in df_s.columns if "asal" in c.lower() or "asing" in c.lower())
-    col_hasil = next(c for c in df_s.columns if "serapan" in c.lower() or "hasil" in c.lower())
-    for _, r in df_s.iterrows():
-        a, h = normalize_token(str(r[col_asal])), normalize_token(str(r[col_hasil]))
-        if a and h: serapan_map[a] = h; serapan_set.add(a)
+    if not df_s.empty:
+        # Deteksi kolom secara dinamis
+        col_asal = next((c for c in df_s.columns if any(x in c.lower() for x in ["asal", "asing"])), df_s.columns[0])
+        col_hasil = next((c for c in df_s.columns if any(x in c.lower() for x in ["serapan", "hasil", "baku"])), df_s.columns[-1])
+        for _, r in df_s.iterrows():
+            a, h = normalize_token(str(r[col_asal])), normalize_token(str(r[col_hasil]))
+            if a and h:
+                serapan_map[a] = h
+                serapan_set.add(a)
 
     return kbbi_set, inggris_set, whitelist_set, serapan_map, serapan_set, sorted(kbbi_set)
 
 # ==============================================================
-# LOGIKA PREDIKSI & JW
+# LOGIKA SIMILARITY & ANALISIS
 # ==============================================================
 
 def jaro_winkler_similarity(s1, s2):
@@ -204,15 +221,15 @@ def analyze_text(text, tokenizer, bert_model, device, kbbi_set, inggris_set, whi
             if not t or len(t) < 2 or is_number_token(t) or is_all_caps_token(tok) or t in whitelist_set: continue
             if skip_proper_noun and is_title_case_name(tok, pos, kbbi_set, inggris_set, serapan_set, whitelist_set): continue
 
-            # Jalur Cepat: Cek Kamus
+            # Klasifikasi Cepat
             if t in serapan_set:
-                flag, status = "KATA_SERAPAN", "KATA_SERAPAN"
+                flag = "KATA_SERAPAN"
             elif t in kbbi_set or stemmer.stem(t) in kbbi_set:
                 continue
             elif t in inggris_set:
-                flag, status = "KATA_INGGRIS", "KATA_INGGRIS"
+                flag = "KATA_INGGRIS"
             else:
-                # Jalur Analisis: JW + BERT
+                # JW & BERT
                 sims = sorted([(w, jaro_winkler_similarity(t, w)) for w in kbbi_list], key=lambda x: x[1], reverse=True)
                 best_w, best_s = sims[0]
                 
@@ -221,19 +238,18 @@ def analyze_text(text, tokenizer, bert_model, device, kbbi_set, inggris_set, whi
                     out = bert_model(input_ids=enc["input_ids"].to(device), attention_mask=enc["attention_mask"].to(device), token_type_ids=enc["token_type_ids"].to(device))
                 probs = torch.softmax(out.logits, dim=1).cpu().numpy()[0]
                 
-                is_err = (best_s < JW_CFG["threshold"]) or (np.argmax(probs) == 1)
-                if not is_err: continue
-                flag, status = "TYPO", "TIDAK_DIKENAL"
+                if (best_s >= JW_CFG["threshold"]) and (np.argmax(probs) == 0): continue
+                flag = "TYPO"
 
-            # Bangun Rekomendasi & Catatan
+            # Detail Temuan
             recs = []
             catatan = ""
             if flag == "KATA_SERAPAN":
-                h = serapan_map.get(t)
+                h = serapan_map.get(t, "-")
                 catatan = f"Saran serapan baku: '{h}'"; recs = [h]
             elif flag == "KATA_INGGRIS":
                 h = serapan_map.get(t)
-                catatan = f"Padanan KBBI: '{h}'" if h else "Cetak miring jika dipertahankan"
+                catatan = f"Padanan KBBI: '{h}'" if h else "Gunakan huruf miring jika dipertahankan"
             else:
                 recs = [w for w, _ in sims[:5]]
             
@@ -265,15 +281,14 @@ def render_annotated_box(text, rows):
         else: parts.append(escape_html(m.group()))
         cursor = m.end()
     parts.append(escape_html(text[cursor:]))
-    html_content = "".join(parts)
-    st.markdown(f'<div class="text-preview-box">{html_content}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="text-preview-box">{"".join(parts)}</div>', unsafe_allow_html=True)
 
 # ==============================================================
 # MAIN APP
 # ==============================================================
 
 st.title("📝 Penyunting Kata Berita")
-st.markdown("Normalisasi teks menggunakan **Hybrid Jaro-Winkler & IndoBERT**.")
+st.markdown("Normalisasi teks berita menggunakan **Hybrid Jaro-Winkler & IndoBERT**.")
 
 with st.sidebar:
     st.header("Pengaturan")
@@ -281,51 +296,50 @@ with st.sidebar:
     show_ser = st.checkbox("Tandai Kata Serapan", True)
     skip_pn = st.checkbox("Abaikan Nama (Proper Noun)", True)
     st.divider()
-    st.caption("Noeni Indah Sulistiyani - UIN Jakarta")
+    st.caption("Penelitian Noeni Indah Sulistiyani - UIN Jakarta")
 
-tokenizer, bert_model, device = load_model()
-kbbi_set, inggris_set, whitelist_set, serapan_map, serapan_set, kbbi_list = load_lexicons()
+with st.spinner("Menyiapkan data riset..."):
+    tokenizer, bert_model, device = load_model()
+    kbbi_set, inggris_set, whitelist_set, serapan_map, serapan_set, kbbi_list = load_lexicons()
 
-input_text = st.text_area("Input Teks Berita:", height=200)
+input_text = st.text_area("Masukkan teks berita UIN Jakarta:", height=200, placeholder="Tempel teks di sini...")
 
 if st.button("🔍 Jalankan Analisis", type="primary") and input_text:
     t0 = time.time()
     raw_results = analyze_text(input_text, tokenizer, bert_model, device, kbbi_set, inggris_set, whitelist_set, serapan_map, serapan_set, kbbi_list, skip_pn)
     
-    # Filter berdasarkan sidebar
     results = [r for r in raw_results if (r["flag"] != "KATA_INGGRIS" or show_ing) and (r["flag"] != "KATA_SERAPAN" or show_ser)]
     elapsed = round(time.time() - t0, 2)
 
-    # 1. Ringkasan Statistik
     c1, c2, c3 = st.columns(3)
-    c1.metric("Typo/Tidak Baku", sum(1 for r in results if r["flag"]=="TYPO"))
+    c1.metric("Typo / Tidak Baku", sum(1 for r in results if r["flag"]=="TYPO"))
     c2.metric("Total Temuan", len(results))
-    c3.metric("Waktu", f"{elapsed}s")
+    c3.metric("Waktu Analisis", f"{elapsed}s")
 
-    # 2. Kotak Anotasi (KOTAK PUTIH)
-    st.subheader("Hasil Anotasi")
+    st.subheader("Hasil Anotasi Teks")
     render_annotated_box(input_text, results)
 
-    # 3. Tabel Ringkasan
     if results:
         st.subheader("Ringkasan Temuan")
         df_view = pd.DataFrame([{
-            "Token": r["token"], "Jenis": FLAG_STYLES[r["flag"]]["label"],
-            "Saran Utama": r["rekomendasi"][0] if r["rekomendasi"] else "-"
+            "Kata": r["token"], 
+            "Jenis": FLAG_STYLES[r["flag"]]["label"],
+            "Saran": r["rekomendasi"][0] if r["rekomendasi"] else "-",
+            "Keterangan": r["catatan"] if r["catatan"] else "-"
         } for r in results])
         st.dataframe(df_view, use_container_width=True, hide_index=True)
 
-        # 4. Detail Per Token (DETAIL DI BAWAH TABEL)
-        st.subheader("📑 Detail Per Token")
+        st.subheader("📑 Detail Analisis Per Token")
         for i, r in enumerate(results):
             with st.expander(f"{i+1}. {r['token']} ({FLAG_STYLES[r['flag']]['label']})"):
-                col1, col2 = st.columns([1, 1])
+                col1, col2 = st.columns([2, 1])
                 with col1:
-                    st.write(f"**Kata Asli:** `{r['token']}`")
-                    st.write(f"**Konteks:** ...{r['kalimat'][:50]}...")
+                    st.write(f"**Konteks Kalimat:**")
+                    st.info(f"\"{r['kalimat']}\"")
                 with col2:
                     if r["flag"] == "TYPO":
-                        st.write("**Saran Perbaikan (Top 5):**")
+                        st.write("**Top 5 Saran (Jaro-Winkler):**")
                         st.success(", ".join(r["rekomendasi"]))
                     elif r["catatan"]:
-                        st.info(r["catatan"])
+                        st.write("**Rekomendasi Riset:**")
+                        st.warning(r["catatan"])
