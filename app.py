@@ -13,7 +13,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
-from transformers import BertForSequenceClassification, BertTokenizer
+from transformers import (
+    BertForMaskedLM,
+    BertForSequenceClassification,
+    BertTokenizer,
+)
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 
 from config import DRIVE_IDS, JW_CFG, MODEL_CFG
@@ -222,7 +226,11 @@ LEXICON_COL_MAP = {
 
 @st.cache_resource(show_spinner=False)
 def load_model():
-    """Unduh (jika belum ada) dan load model IndoBERT dari Drive."""
+    """
+    Unduh (jika belum ada) dan load dua model dari folder Drive yang sama:
+      1. BertForSequenceClassification  → deteksi error (pred 0/1)
+      2. BertForMaskedLM                → reranking kandidat via MLM score
+    """
     config_path = os.path.join(MODEL_LOCAL, "config.json")
     if not os.path.exists(config_path):
         gdown.download_folder(
@@ -234,13 +242,26 @@ def load_model():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = BertTokenizer.from_pretrained(MODEL_LOCAL)
-    model = BertForSequenceClassification.from_pretrained(
+
+    # Model 1 – sequence classification (deteksi error kata)
+    clf_model = BertForSequenceClassification.from_pretrained(
         MODEL_LOCAL,
         num_labels=MODEL_CFG["num_labels"],
+        ignore_mismatched_sizes=True,
     )
-    model.to(device)
-    model.eval()
-    return tokenizer, model, device
+    clf_model.to(device)
+    clf_model.eval()
+
+    # Model 2 – MLM (reranking kandidat Jaro-Winkler)
+    # Gunakan weight yang sama; hanya head-nya berbeda.
+    mlm_model = BertForMaskedLM.from_pretrained(
+        MODEL_LOCAL,
+        ignore_mismatched_sizes=True,
+    )
+    mlm_model.to(device)
+    mlm_model.eval()
+
+    return tokenizer, clf_model, mlm_model, device
 
 
 @st.cache_resource(show_spinner=False)
@@ -462,11 +483,12 @@ def predict_jw(
 
 
 # ==============================================================
-# PREDIKSI INDOBERT
+# PREDIKSI INDOBERT (SEQUENCE CLASSIFICATION)
 # ==============================================================
 
 
-def predict_bert(kalimat: str, token: str, tokenizer, model, device) -> dict:
+def predict_bert(kalimat: str, token: str, tokenizer, clf_model, device) -> dict:
+    """Prediksi error kata menggunakan model sequence classification."""
     text_a = clean_whitespace(kalimat)
     text_b = normalize_token(token)
     enc = tokenizer(
@@ -478,7 +500,7 @@ def predict_bert(kalimat: str, token: str, tokenizer, model, device) -> dict:
         return_tensors="pt",
     )
     with torch.no_grad():
-        outputs = model(
+        outputs = clf_model(
             input_ids=enc["input_ids"].to(device),
             attention_mask=enc["attention_mask"].to(device),
             token_type_ids=enc["token_type_ids"].to(device),
@@ -493,6 +515,108 @@ def predict_bert(kalimat: str, token: str, tokenizer, model, device) -> dict:
 
 
 # ==============================================================
+# RERANKING KANDIDAT DENGAN INDOBERT MLM
+# ==============================================================
+
+
+def mlm_score_candidate(
+    sentence: str,
+    target_token: str,
+    candidate: str,
+    tokenizer,
+    mlm_model,
+    device,
+) -> float:
+    """
+    Hitung log-probability rata-rata untuk setiap sub-token dari `candidate`
+    ketika ditempatkan di posisi `target_token` dalam kalimat (masked).
+    Nilai lebih tinggi = kandidat lebih sesuai konteks.
+    """
+    # Bentuk kalimat dengan kandidat menggantikan token asli
+    # Gunakan regex word-boundary agar hanya ganti yang pertama
+    sent_with_candidate = re.sub(
+        rf"\b{re.escape(target_token)}\b",
+        candidate,
+        sentence,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+    # Tokenisasi → mask satu sub-token kandidat sekaligus
+    enc = tokenizer(
+        sent_with_candidate,
+        return_tensors="pt",
+        truncation=True,
+        max_length=MODEL_CFG["max_length"],
+    )
+    input_ids = enc["input_ids"].to(device)
+    attention_mask = enc["attention_mask"].to(device)
+
+    # Temukan posisi sub-token kandidat dalam kalimat ter-tokenisasi
+    cand_ids = tokenizer.encode(candidate, add_special_tokens=False)
+    if not cand_ids:
+        return -1e9
+
+    token_ids_list = input_ids[0].tolist()
+    log_prob_sum = 0.0
+    found_any = False
+
+    for idx_start in range(len(token_ids_list) - len(cand_ids) + 1):
+        window = token_ids_list[idx_start : idx_start + len(cand_ids)]
+        if window != cand_ids:
+            continue
+
+        # Mask dan prediksi setiap posisi sub-token
+        for offset, cand_id in enumerate(cand_ids):
+            masked_ids = input_ids.clone()
+            target_pos = idx_start + offset
+            masked_ids[0, target_pos] = tokenizer.mask_token_id
+
+            with torch.no_grad():
+                logits = mlm_model(
+                    input_ids=masked_ids,
+                    attention_mask=attention_mask,
+                ).logits  # (1, seq_len, vocab_size)
+
+            log_probs = torch.log_softmax(logits[0, target_pos], dim=-1)
+            log_prob_sum += log_probs[cand_id].item()
+            found_any = True
+        break  # hanya ambil kemunculan pertama
+
+    if not found_any:
+        return -1e9
+
+    return log_prob_sum / len(cand_ids)
+
+
+def rerank_candidates(
+    sentence: str,
+    target_token: str,
+    candidates: List[str],
+    tokenizer,
+    mlm_model,
+    device,
+    top_k: int = 5,
+) -> List[Tuple[str, float]]:
+    """
+    Rerank daftar kandidat berdasarkan skor MLM kontekstual IndoBERT.
+    Kembalikan list (kandidat, skor) urutan tertinggi ke terendah.
+    """
+    if not candidates:
+        return []
+
+    scored: List[Tuple[str, float]] = []
+    for cand in candidates:
+        score = mlm_score_candidate(
+            sentence, target_token, cand, tokenizer, mlm_model, device
+        )
+        scored.append((cand, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:top_k]
+
+
+# ==============================================================
 # KEPUTUSAN HYBRID
 # ==============================================================
 
@@ -502,6 +626,7 @@ def decide_final_pred(model_choice: str, jw_pred: int, bert_pred: int) -> int:
         return jw_pred
     if model_choice == "IndoBERT":
         return bert_pred
+    # Hybrid-OR: tandai jika salah satu model mendeteksi error
     return 1 if (jw_pred == 1 or bert_pred == 1) else 0
 
 
@@ -514,7 +639,8 @@ def analyze_text(
     text: str,
     model_choice: str,
     tokenizer,
-    bert_model,
+    clf_model,
+    mlm_model,
     device,
     kbbi_set,
     inggris_set,
@@ -523,6 +649,7 @@ def analyze_text(
     serapan_set,
     kbbi_list,
     skip_proper_noun: bool = True,
+    use_reranking: bool = True,
 ) -> List[dict]:
     sentences = extract_sentence_spans(text)
     results: List[dict] = []
@@ -539,9 +666,12 @@ def analyze_text(
                 continue
             if t in whitelist_set:
                 continue
-            if skip_proper_noun and is_title_case_name(tok, pos, kbbi_set, inggris_set, serapan_set, whitelist_set):
+            if skip_proper_noun and is_title_case_name(
+                tok, pos, kbbi_set, inggris_set, serapan_set, whitelist_set
+            ):
                 continue
 
+            # --- Jaro-Winkler ---
             jw_res = predict_jw(
                 t,
                 kbbi_set,
@@ -555,116 +685,73 @@ def analyze_text(
 
             status = jw_res["status"]
 
-            # Short-circuit untuk token yang sudah valid / non-error
-            if status in [
-                "KATA_INGGRIS",
-                "KATA_SERAPAN",
-                "WHITELIST_KHUSUS",
-                "KBBI_VALID",
-                "ANGKA",
-            ]:
+            # --- IndoBERT sequence classification (skip jika token sudah valid) ---
+            if status in ("KATA_INGGRIS", "KATA_SERAPAN", "WHITELIST_KHUSUS", "KBBI_VALID", "ANGKA"):
                 bert_res = {
                     "pred": 0,
                     "prob_correct": 1.0,
                     "prob_error": 0.0,
                 }
             else:
-                bert_res = predict_bert(sent, t, tokenizer, bert_model, device)
+                bert_res = predict_bert(sent, t, tokenizer, clf_model, device)
 
             jw_pred = jw_res["pred"]
             bert_pred = bert_res["pred"]
             final_pred = decide_final_pred(model_choice, jw_pred, bert_pred)
 
+            # ------------------------------------------------------------------
+            # TENTUKAN FLAG, REKOMENDASI, DAN CATATAN
+            # ------------------------------------------------------------------
+
+            recs: List[str] = []
+            catatan: str = ""
+            reranked_with_scores: List[Tuple[str, float]] = []
+
             if status == "KATA_INGGRIS":
+                # ── Kata Bahasa Inggris ────────────────────────────────────────
                 flag = "KATA_INGGRIS"
                 tipe = "Kata Bahasa Inggris"
-                final_pred = 0
+                final_pred = 0  # bukan error, hanya peringatan
+                catatan = "Gunakan huruf miring jika kata tetap digunakan"
+
             elif status == "KATA_SERAPAN":
-
+                # ── Kata Serapan ───────────────────────────────────────────────
                 flag = "KATA_SERAPAN"
-            
                 tipe = "Kata Asing dengan Padanan KBBI"
-            
-                final_pred = 0
-            
+                final_pred = 0  # bukan error, hanya saran
                 padanan = serapan_map.get(t)
-
-            
                 if padanan:
-            
                     recs = [padanan]
-            
                     catatan = (
                         f"Disarankan menggunakan bentuk baku "
                         f"bahasa Indonesia: '{padanan}'"
                     )
-            elif final_pred == 1:
-                flag = "TYPO"
-                tipe = "Typo"
-            else:
-                continue
 
-            # ==========================================================
-            # DEFAULT REKOMENDASI
-            # ==========================================================
-            
-            recs = jw_res["top_k_recs"]
-            catatan = ""
-            
-            # ==========================================================
-            # KATA INGGRIS
-            # ==========================================================
-            
-            if status == "KATA_INGGRIS":
-            
-                flag = "KATA_INGGRIS"
-            
-                tipe = "Kata Bahasa Inggris"
-            
-                final_pred = 0
-            
-                catatan = (
-                    "Gunakan huruf miring jika kata tetap digunakan"
-                )
-            
-            # ==========================================================
-            # KATA SERAPAN
-            # ==========================================================
-            
-            elif status == "KATA_SERAPAN":
-            
-                flag = "KATA_SERAPAN"
-            
-                tipe = "Kata Asing dengan Padanan KBBI"
-            
-                final_pred = 0
-            
-                padanan = serapan_map.get(t)
-            
-                if padanan:
-            
-                    # ==================================================
-                    # PAKSA REKOMENDASI MASUK
-                    # ==================================================
-            
-                    recs = [padanan]
-            
-                    catatan = (
-                        f"Disarankan menggunakan bentuk baku "
-                        f"bahasa Indonesia: '{padanan}'"
-                    )
-            
-            # ==========================================================
-            # TYPO / TIDAK BAKU
-            # ==========================================================
-            
             elif final_pred == 1:
-            
+                # ── Typo / Kata Tidak Baku ─────────────────────────────────────
                 flag = "TYPO"
-            
                 tipe = "Salah Ketik / Kata Tidak Baku"
-            
+
+                jw_candidates = jw_res["top_k_recs"]  # sudah diurutkan by JW sim
+
+                if use_reranking and jw_candidates and model_choice in ("IndoBERT", "Hybrid-OR"):
+                    # Rerank kandidat JW menggunakan IndoBERT MLM score
+                    reranked_with_scores = rerank_candidates(
+                        sent,
+                        tok,           # token asli (case-preserved) untuk regex
+                        jw_candidates,
+                        tokenizer,
+                        mlm_model,
+                        device,
+                        top_k=JW_CFG["top_k"],
+                    )
+                    recs = [w for w, _ in reranked_with_scores]
+                else:
+                    # Fallback: pakai urutan JW biasa
+                    recs = jw_candidates
+
             else:
+                # Token OK → lewati
                 continue
 
             results.append(
@@ -685,6 +772,7 @@ def analyze_text(
                     "jw_sim": jw_res["max_sim"],
                     "best_match": jw_res["best_match"],
                     "rekomendasi": recs,
+                    "reranked_scores": reranked_with_scores,   # untuk detail view
                     "catatan": catatan,
                     "highlight": True,
                 }
@@ -731,19 +819,13 @@ def build_tooltip(row: dict) -> str:
             lines.append("atau cetak miring jika tetap digunakan")
 
     elif flag == "KATA_SERAPAN":
-
         lines = [
-            f"\U0001f4cc “{token}” memiliki "
+            f"\U0001f4cc \u201c{token}\u201d memiliki "
             f"padanan baku bahasa Indonesia"
         ]
-    
         if row.get("rekomendasi"):
-    
             padanan = row["rekomendasi"][0]
-    
-            lines.append(
-                f"Disarankan menggunakan: {padanan}"
-            )
+            lines.append(f"Disarankan menggunakan: {padanan}")
 
     else:
         lines = [f"Kata: {token}"]
@@ -757,7 +839,7 @@ def render_highlighted_text(text: str, rows: List[dict]) -> str:
     cursor = 0
 
     for m in re.finditer(r"\b\w+\b", text, flags=re.UNICODE):
-        parts.append(escape_html(text[cursor:m.start()]))
+        parts.append(escape_html(text[cursor : m.start()]))
         row = row_map.get((m.start(), m.end()))
         token_html = html_lib.escape(m.group())
         if row:
@@ -813,16 +895,32 @@ with st.sidebar:
     st.caption("Alat bantu pengecekan bahasa untuk berita universitas")
     st.markdown("---")
 
+    st.markdown("**Pengaturan Model**")
+    use_reranking = st.toggle(
+        "Aktifkan reranking IndoBERT",
+        value=True,
+        help=(
+            "Saat aktif, kandidat saran dari Jaro-Winkler akan diurutkan ulang "
+            "berdasarkan skor konteks kalimat menggunakan IndoBERT (MLM). "
+            "Hasil saran lebih relevan, tapi sedikit lebih lambat."
+        ),
+    )
+
+    st.markdown("---")
     st.markdown("**Pengaturan Tampilan**")
-    show_inggris = st.toggle("Tandai kata bahasa Inggris", value=True, help="Tampilkan kata-kata berbahasa Inggris yang ditemukan dalam teks")
-    show_serapan = st.toggle("Tandai kata serapan", value=True, help="Tampilkan kata serapan asing yang sudah diserap ke bahasa Indonesia")
-    skip_proper_noun = st.toggle("Abaikan nama orang/tempat", value=True, help="Nama orang, tempat, dan lembaga yang diawali huruf kapital tidak akan ditandai")
+    show_inggris = st.toggle("Tandai kata bahasa Inggris", value=True)
+    show_serapan = st.toggle("Tandai kata serapan", value=True)
+    skip_proper_noun = st.toggle(
+        "Abaikan nama orang/tempat",
+        value=True,
+        help="Nama orang, tempat, dan lembaga yang diawali huruf kapital tidak akan ditandai",
+    )
 
     st.markdown("---")
     st.markdown(
         '<div style="font-size:0.82rem; color:#6b7280; line-height:1.6;">'
-        'ℹ️ Angka, singkatan, dan akronim diabaikan secara otomatis.'
-        '</div>',
+        "ℹ️ Angka, singkatan, dan akronim diabaikan secara otomatis."
+        "</div>",
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -836,7 +934,7 @@ st.markdown(
 st.markdown("---")
 
 with st.spinner("Memuat sistem..."):
-    tokenizer, bert_model, device = load_model()
+    tokenizer, clf_model, mlm_model, device = load_model()
     kbbi_set, inggris_set, whitelist_set, serapan_map, serapan_set, kbbi_list = load_lexicons()
 
 st.success("Sistem siap digunakan.", icon="✅")
@@ -883,7 +981,8 @@ if text_to_run:
             text_to_run,
             model_choice,
             tokenizer,
-            bert_model,
+            clf_model,
+            mlm_model,
             device,
             kbbi_set,
             inggris_set,
@@ -892,6 +991,7 @@ if text_to_run:
             serapan_set,
             kbbi_list,
             skip_proper_noun=skip_proper_noun,
+            use_reranking=use_reranking,
         )
         elapsed = round(time.time() - t0, 2)
 
@@ -905,7 +1005,9 @@ if text_to_run:
 
     st.markdown("---")
 
-    total_tok = len([t for t in re.findall(r"\b\w+\b", text_to_run, flags=re.UNICODE) if len(t) >= 2])
+    total_tok = len(
+        [t for t in re.findall(r"\b\w+\b", text_to_run, flags=re.UNICODE) if len(t) >= 2]
+    )
     n_err = sum(1 for r in results_display if r["flag"] == "TYPO")
     n_flag = len(results_display)
     n_inggris = sum(1 for r in results_display if r["flag"] == "KATA_INGGRIS")
@@ -933,15 +1035,17 @@ if text_to_run:
 
     if results_display:
         st.markdown("### 📊 Daftar Kata yang Ditandai")
-        tabel = pd.DataFrame([
-            {
-                "Kata": r["token"],
-                "Jenis Temuan": FLAG_STYLES.get(r["flag"], {}).get("label", r["flag"]),
-                "Saran Perbaikan": ", ".join(r["rekomendasi"]) if r["rekomendasi"] else "-",
-                "Keterangan": r["catatan"] or "-",
-            }
-            for r in results_display
-        ])
+        tabel = pd.DataFrame(
+            [
+                {
+                    "Kata": r["token"],
+                    "Jenis Temuan": FLAG_STYLES.get(r["flag"], {}).get("label", r["flag"]),
+                    "Saran Perbaikan": ", ".join(r["rekomendasi"]) if r["rekomendasi"] else "-",
+                    "Keterangan": r["catatan"] or "-",
+                }
+                for r in results_display
+            ]
+        )
 
         st.dataframe(
             tabel,
@@ -959,15 +1063,32 @@ if text_to_run:
                     st.markdown(f"**Kata:** `{r['token']}`")
                     st.markdown(f"**Jenis temuan:** {flag_label}")
                     if r["flag"] == "TYPO":
-                        st.markdown(f"**Kata yang paling mirip di KBBI:** {r['best_match']}")
+                        st.markdown(f"**Kata paling mirip (JW):** {r['best_match']}")
+                        st.markdown(
+                            f"**Skor JW:** {r['jw_sim']} | "
+                            f"**IndoBERT error prob:** {r['prob_error']}"
+                        )
                     if r["catatan"]:
                         st.info(r["catatan"])
 
                 with col_r:
                     if r["flag"] == "TYPO" and r["rekomendasi"]:
-                        st.markdown("**Saran pengganti (top 5):**")
-                        for rec in r["rekomendasi"]:
-                            st.code(rec)
+                        reranked = r.get("reranked_scores", [])
+                        if reranked and use_reranking:
+                            st.markdown(
+                                "**Saran pengganti** _(diurutkan oleh IndoBERT — paling kontekstual di atas)_:"
+                            )
+                            for rank, (word, score) in enumerate(reranked, 1):
+                                st.markdown(
+                                    f"`{rank}.` **{word}** "
+                                    f"<span style='color:#6b7280; font-size:0.85rem;'>"
+                                    f"(skor MLM: {score:.3f})</span>",
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            st.markdown("**Saran pengganti (top 5):**")
+                            for rec in r["rekomendasi"]:
+                                st.code(rec)
                     elif r["flag"] == "KATA_INGGRIS":
                         st.markdown("**Saran:**")
                         catatan = r.get("catatan", "")
@@ -975,7 +1096,12 @@ if text_to_run:
                             padanan = catatan.replace("Padanan KBBI: ", "").strip("'")
                             st.code(padanan)
                         else:
-                            st.caption("Gunakan padanan bahasa Indonesia, atau cetak miring jika dipertahankan.")
+                            st.caption(
+                                "Gunakan padanan bahasa Indonesia, atau cetak miring jika dipertahankan."
+                            )
+                    elif r["flag"] == "KATA_SERAPAN" and r["rekomendasi"]:
+                        st.markdown("**Padanan baku yang disarankan:**")
+                        st.code(r["rekomendasi"][0])
                     else:
                         st.caption("Pastikan penulisan kata ini sudah sesuai KBBI.")
 
