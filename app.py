@@ -462,47 +462,55 @@ def predict_jw(
 
 
 # ==============================================================
-# PREDIKSI INDOBERT
+# RERANKING KANDIDAT DENGAN INDOBERT
 # ==============================================================
 
 
-def predict_bert(kalimat: str, token: str, tokenizer, model, device) -> dict:
-    text_a = clean_whitespace(kalimat)
-    text_b = normalize_token(token)
-    enc = tokenizer(
-        text_a,
-        text_b,
-        max_length=MODEL_CFG["max_length"],
-        truncation=True,
-        padding="max_length",
-        return_tensors="pt",
-    )
-    with torch.no_grad():
-        outputs = model(
-            input_ids=enc["input_ids"].to(device),
-            attention_mask=enc["attention_mask"].to(device),
-            token_type_ids=enc["token_type_ids"].to(device),
+def rerank_candidates_with_bert(
+    sentence: str,
+    original_token: str,
+    candidates: List[str],
+    tokenizer,
+    model,
+    device,
+) -> List[dict]:
+    """
+    Untuk setiap kandidat koreksi, ganti token asli di kalimat,
+    lalu score-kan dengan IndoBERT (prob class BENAR/CORRECT).
+    Kembalikan daftar kandidat terurut dari skor tertinggi.
+    """
+    candidate_scores = []
+
+    for cand in candidates:
+        # Ganti token asli dengan kandidat dalam kalimat
+        modified_sentence = re.sub(
+            rf"\b{re.escape(original_token)}\b",
+            cand,
+            clean_whitespace(sentence),
+            count=1,
         )
-    probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()[0]
-    pred = int(np.argmax(probs))
-    return {
-        "pred": pred,
-        "prob_correct": round(float(probs[0]), 4),
-        "prob_error": round(float(probs[1]), 4),
-    }
 
+        enc = tokenizer(
+            modified_sentence,
+            max_length=MODEL_CFG["max_length"],
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+        )
 
-# ==============================================================
-# KEPUTUSAN HYBRID
-# ==============================================================
+        with torch.no_grad():
+            outputs = model(
+                input_ids=enc["input_ids"].to(device),
+                attention_mask=enc["attention_mask"].to(device),
+            )
 
+        probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()[0]
+        # probs[0] = prob CORRECT (class 0) → skor tinggi = kandidat lebih cocok
+        score = float(probs[0])
+        candidate_scores.append({"candidate": cand, "score": round(score, 4)})
 
-def decide_final_pred(model_choice: str, jw_pred: int, bert_pred: int) -> int:
-    if model_choice == "Jaro-Winkler":
-        return jw_pred
-    if model_choice == "IndoBERT":
-        return bert_pred
-    return 1 if (jw_pred == 1 or bert_pred == 1) else 0
+    candidate_scores.sort(key=lambda x: x["score"], reverse=True)
+    return candidate_scores
 
 
 # ==============================================================
@@ -512,7 +520,6 @@ def decide_final_pred(model_choice: str, jw_pred: int, bert_pred: int) -> int:
 
 def analyze_text(
     text: str,
-    model_choice: str,
     tokenizer,
     bert_model,
     device,
@@ -524,6 +531,14 @@ def analyze_text(
     kbbi_list,
     skip_proper_noun: bool = True,
 ) -> List[dict]:
+    """
+    Pipeline Hybrid Reranking:
+      1. Jaro-Winkler → deteksi token mencurigakan & generate kandidat koreksi
+      2. IndoBERT     → rerank kandidat berdasarkan skor kontekstual
+    Token dianggap ERROR jika JW memprediksi ERROR (pred == 1).
+    Rekomendasi diurutkan ulang oleh IndoBERT berdasarkan
+    seberapa baik kandidat cocok dalam konteks kalimat.
+    """
     sentences = extract_sentence_spans(text)
     results: List[dict] = []
 
@@ -542,6 +557,7 @@ def analyze_text(
             if skip_proper_noun and is_title_case_name(tok, pos, kbbi_set, inggris_set, serapan_set, whitelist_set):
                 continue
 
+            # ── Langkah 1: Jaro-Winkler ───────────────────────
             jw_res = predict_jw(
                 t,
                 kbbi_set,
@@ -555,41 +571,41 @@ def analyze_text(
 
             status = jw_res["status"]
 
-            # Short-circuit untuk token yang sudah valid / non-error
-            if status in [
-                "KATA_INGGRIS",
-                "KATA_SERAPAN",
-                "WHITELIST_KHUSUS",
-                "KBBI_VALID",
-                "ANGKA",
-            ]:
-                bert_res = {
-                    "pred": 0,
-                    "prob_correct": 1.0,
-                    "prob_error": 0.0,
-                }
-            else:
-                bert_res = predict_bert(sent, t, tokenizer, bert_model, device)
-
-            jw_pred = jw_res["pred"]
-            bert_pred = bert_res["pred"]
-            final_pred = decide_final_pred(model_choice, jw_pred, bert_pred)
-
+            # Tentukan flag berdasarkan status leksikon
             if status == "KATA_INGGRIS":
                 flag = "KATA_INGGRIS"
                 tipe = "Kata Bahasa Inggris"
-                final_pred = 0
             elif status == "KATA_SERAPAN":
                 flag = "KATA_SERAPAN"
                 tipe = "Kata Serapan"
-                final_pred = 0
-            elif final_pred == 1:
+            elif jw_res["pred"] == 1:
                 flag = "TYPO"
                 tipe = "Typo"
             else:
+                # Token valid secara leksikal → lewati
                 continue
 
-            recs = jw_res["top_k_recs"]
+            # ── Langkah 2: IndoBERT Reranking (khusus TYPO) ───
+            candidates = jw_res["top_k_recs"]
+            best_match = jw_res["best_match"]
+            best_score = 0.0
+            reranked_candidates = candidates  # default: urutan JW
+
+            if flag == "TYPO" and candidates:
+                reranked = rerank_candidates_with_bert(
+                    sentence=sent,
+                    original_token=t,
+                    candidates=candidates,
+                    tokenizer=tokenizer,
+                    model=bert_model,
+                    device=device,
+                )
+                if reranked:
+                    best_match = reranked[0]["candidate"]
+                    best_score = reranked[0]["score"]
+                    reranked_candidates = [x["candidate"] for x in reranked]
+
+            # ── Catatan tambahan ───────────────────────────────
             catatan = ""
             if status == "KATA_INGGRIS":
                 padanan = serapan_map.get(t)
@@ -605,14 +621,11 @@ def analyze_text(
                     "end": sent_start + end,
                     "flag": flag,
                     "tipe_error": tipe,
-                    "jw_pred": "ERROR" if jw_pred else "OK",
-                    "bert_pred": "ERROR" if bert_pred else "OK",
-                    "final_pred": "ERROR" if final_pred else "OK",
-                    "prob_error": bert_res["prob_error"],
-                    "prob_correct": bert_res["prob_correct"],
+                    "jw_pred": "ERROR" if jw_res["pred"] else "OK",
                     "jw_sim": jw_res["max_sim"],
-                    "best_match": jw_res["best_match"],
-                    "rekomendasi": recs,
+                    "best_match": best_match,
+                    "best_score": round(best_score, 4),
+                    "rekomendasi": reranked_candidates,
                     "catatan": catatan,
                     "highlight": True,
                 }
@@ -643,7 +656,7 @@ def build_tooltip(row: dict) -> str:
         lines = [f"\u26a0\ufe0f \u201c{token}\u201d terdeteksi sebagai salah ketik"]
         if row.get("rekomendasi"):
             top = row["rekomendasi"][:3]
-            lines.append("Saran pengganti: " + ", ".join(top))
+            lines.append("Saran pengganti (reranked): " + ", ".join(top))
         elif row.get("best_match"):
             lines.append(f"Kata yang paling mirip: {row['best_match']}")
         lines.append("\u2192 Periksa kembali ejaan kata ini")
@@ -723,11 +736,10 @@ def render_legend() -> None:
 # ANTARMUKA STREAMLIT
 # ==============================================================
 
-model_choice = "Hybrid-OR"
-
 with st.sidebar:
     st.markdown("### 📝 Penyunting Kata Berita")
     st.caption("Alat bantu pengecekan bahasa untuk berita universitas")
+    st.caption("🔬 Model: Hybrid Reranking (JW + IndoBERT)")
     st.markdown("---")
 
     st.markdown("**Pengaturan Tampilan**")
@@ -798,7 +810,6 @@ if text_to_run:
         t0 = time.time()
         results = analyze_text(
             text_to_run,
-            model_choice,
             tokenizer,
             bert_model,
             device,
@@ -876,7 +887,9 @@ if text_to_run:
                     st.markdown(f"**Kata:** `{r['token']}`")
                     st.markdown(f"**Jenis temuan:** {flag_label}")
                     if r["flag"] == "TYPO":
-                        st.markdown(f"**Kata yang paling mirip di KBBI:** {r['best_match']}")
+                        st.markdown(f"**Rekomendasi teratas (IndoBERT):** `{r['best_match']}`")
+                        if r.get("best_score", 0) > 0:
+                            st.markdown(f"**Skor kontekstual:** {r['best_score']:.4f}")
                     if r["catatan"]:
                         st.info(r["catatan"])
 
