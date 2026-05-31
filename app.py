@@ -780,6 +780,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+st.markdown("---")
 
 with st.spinner("Memuat sistem..."):
     tokenizer, bert_model, device = load_model()
