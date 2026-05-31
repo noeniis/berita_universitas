@@ -610,6 +610,9 @@ def analyze_text(
             if status == "KATA_INGGRIS":
                 padanan = serapan_map.get(t)
                 catatan = f"Padanan KBBI: '{padanan}'" if padanan else "Gunakan huruf miring jika dipertahankan"
+            elif status == "KATA_SERAPAN":                          
+                padanan = serapan_map.get(t)    
+                catatan = f"Padanan kata asal: '{padanan}'" if padanan else ""  
 
             results.append(
                 {
@@ -673,7 +676,11 @@ def build_tooltip(row: dict) -> str:
 
     elif flag == "KATA_SERAPAN":
         lines = [f"\U0001f4cc \u201c{token}\u201d adalah kata serapan dari bahasa asing"]
-        lines.append("Pastikan penulisannya sudah sesuai KBBI")
+        catatan = row.get("catatan", "")                   
+        if catatan and "Padanan" in catatan:                
+            padanan = catatan.replace("Padanan kata asal: ", "").strip("'")  
+            lines.append(f"Kata asal: {padanan}")    
+            lines.append("Pastikan penulisannya sudah sesuai KBBI")
 
     else:
         lines = [f"Kata: {token}"]
