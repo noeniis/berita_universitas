@@ -770,6 +770,16 @@ st.markdown(
     "mulai dari salah ketik, penggunaan kata asing, hingga kata serapan yang mungkin perlu disesuaikan."
 )
 st.markdown("---")
+st.markdown(
+    """
+    <div style="background:#eff6ff; border:1px solid #3b82f6; border-radius:10px; padding:12px 18px; font-size:0.95rem; color:#1e3a8a;">
+        📂 <b>Belum punya teks berita?</b> Gunakan contoh teks berita yang sudah tersedia —
+        <a href="https://drive.google.com/drive/folders/1KZtLnB61d0VOHr3Q_NrZH8-TL1wGXxCW?usp=drive_link"
+           target="_blank" style="color:#2563eb; font-weight:600;">unduh contoh teks berita di sini</a>.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.spinner("Memuat sistem..."):
     tokenizer, bert_model, device = load_model()
