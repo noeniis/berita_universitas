@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
-from transformers import BertForSequenceClassification, BertTokenizer
+from transformers import BertForSequenceClassification, BertTokenizer, pipeline
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 
 from config import DRIVE_IDS, JW_CFG, MODEL_CFG
@@ -195,7 +195,84 @@ def is_title_case_name(
     # Nama/proper noun biasanya diawali huruf kapital dan bukan ALL CAPS
     return token[0].isupper() and not token.isupper()
 
+def is_name_by_ner(token: str, sentence: str, ner_pipe) -> bool:
+    """
+    Mengecek apakah token termasuk entitas PERSON berdasarkan hasil NER.
+    """
+    if ner_pipe is None:
+        return False
 
+    if not token or not sentence:
+        return False
+
+    token_norm = normalize_token(token)
+
+    try:
+        entities = ner_pipe(str(sentence))
+    except Exception:
+        return False
+
+    for ent in entities:
+        ent_text = normalize_token(ent.get("word", ""))
+        ent_label = str(ent.get("entity_group", "")).upper()
+
+        # Beberapa model memakai label PER atau PERSON
+        is_person_label = (
+            "PER" in ent_label or
+            "PERSON" in ent_label
+        )
+
+        if is_person_label:
+            ent_tokens = ent_text.split()
+
+            if token_norm == ent_text or token_norm in ent_tokens:
+                return True
+
+    return False
+    
+def is_proper_noun_or_person(
+    token: str,
+    position: int,
+    sentence: str,
+    kbbi_set: set,
+    inggris_set: set,
+    serapan_set: set,
+    whitelist_set: set,
+    ner_pipe=None,
+) -> bool:
+    """
+    Menggabungkan deteksi nama/proper noun berbasis:
+    1. Whitelist
+    2. Kapital/title case
+    3. NER PERSON
+    """
+
+    t = normalize_token(token)
+
+    if not t:
+        return False
+
+    # Kalau sudah ada di whitelist, dianggap aman
+    if t in whitelist_set:
+        return True
+
+    # Deteksi berbasis kapital/title case
+    if is_title_case_name(
+        token,
+        position,
+        kbbi_set,
+        inggris_set,
+        serapan_set,
+        whitelist_set,
+    ):
+        return True
+
+    # Deteksi berbasis NER
+    if is_name_by_ner(token, sentence, ner_pipe):
+        return True
+
+    return False
+    
 # ==============================================================
 # PATH LOKAL UNTUK CACHE UNDUHAN
 # ==============================================================
@@ -242,7 +319,25 @@ def load_model():
     model.eval()
     return tokenizer, model, device
 
-
+@st.cache_resource(show_spinner=False)
+def load_ner_model():
+    """
+    Load model NER bahasa Indonesia untuk mengenali entitas nama orang.
+    Model ini digunakan untuk mendeteksi token yang termasuk PERSON/PER.
+    """
+    try:
+        ner_pipe = pipeline(
+            "ner",
+            model="cahya/bert-base-indonesian-NER",
+            tokenizer="cahya/bert-base-indonesian-NER",
+            aggregation_strategy="simple",
+        )
+        return ner_pipe
+    except Exception as e:
+        st.warning("Model NER gagal dimuat. Sistem tetap berjalan tanpa NER.")
+        st.caption(str(e))
+        return None
+        
 @st.cache_resource(show_spinner=False)
 def load_lexicons():
     """Unduh (jika belum ada) dan bangun semua set leksikon dari Drive."""
@@ -529,6 +624,7 @@ def analyze_text(
     serapan_map,
     serapan_set,
     kbbi_list,
+    ner_pipe=None,
     skip_proper_noun: bool = True,
 ) -> List[dict]:
     """
@@ -554,7 +650,16 @@ def analyze_text(
                 continue
             if t in whitelist_set:
                 continue
-            if skip_proper_noun and is_title_case_name(tok, pos, kbbi_set, inggris_set, serapan_set, whitelist_set):
+            if skip_proper_noun and is_proper_noun_or_person(
+                token=tok,
+                position=pos,
+                sentence=sent,
+                kbbi_set=kbbi_set,
+                inggris_set=inggris_set,
+                serapan_set=serapan_set,
+                whitelist_set=whitelist_set,
+                ner_pipe=ner_pipe,
+            ):
                 continue
 
             # ── Langkah 1: Jaro-Winkler ───────────────────────
@@ -752,7 +857,7 @@ with st.sidebar:
     st.markdown("**Pengaturan Tampilan**")
     show_inggris = st.toggle("Tandai kata bahasa Inggris", value=True, help="Tampilkan kata-kata berbahasa Inggris yang ditemukan dalam teks")
     show_serapan = st.toggle("Tandai kata serapan", value=True, help="Tampilkan kata serapan asing yang sudah diserap ke bahasa Indonesia")
-    skip_proper_noun = st.toggle("Abaikan nama orang/tempat", value=True, help="Nama orang, tempat, dan lembaga yang diawali huruf kapital tidak akan ditandai")
+    skip_proper_noun = st.toggle("Abaikan nama orang/tempat/lembaga", value=True, help="Nama orang, tempat, dan lembaga yang diawali huruf kapital tidak akan ditandai")
 
     st.markdown("---")
     st.markdown(
@@ -784,6 +889,7 @@ st.markdown("---")
 
 with st.spinner("Memuat sistem..."):
     tokenizer, bert_model, device = load_model()
+    ner_pipe = load_ner_model()
     kbbi_set, inggris_set, whitelist_set, serapan_map, serapan_set, kbbi_list = load_lexicons()
 
 st.success("Sistem siap digunakan.", icon="✅")
@@ -837,6 +943,7 @@ if text_to_run:
             serapan_map,
             serapan_set,
             kbbi_list,
+            ner_pipe=ner_pipe,
             skip_proper_noun=skip_proper_noun,
         )
         elapsed = round(time.time() - t0, 2)
