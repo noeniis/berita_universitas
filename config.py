@@ -3,7 +3,7 @@
 
 DRIVE_IDS = {
     # Folder model IndoBERT (fine-tuned)
-    "model_indobert"    : "1kF74xhsbfFDlOcu4_DgwMBjYVSOuYSMd",
+    "model_indobert"    : "1xBnC4Lt4DYjEe95_4VAL98tk2yYg1PP4",
 
     # File leksikon
     "kbbi"              : "1JWMWhw7PJNJk-s65RMYDSH4f2pAW5mV4",
