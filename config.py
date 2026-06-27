@@ -6,7 +6,7 @@ DRIVE_IDS = {
     "model_indobert"    : "1xBnC4Lt4DYjEe95_4VAL98tk2yYg1PP4",
 
     # File leksikon
-    "kbbi"              : "1JWMWhw7PJNJk-s65RMYDSH4f2pAW5mV4",
+    "kbbi"              : "1I6RlRkOqjrdG4KVoBAu3iZHZXdObTs23",
     "kata_inggris"      : "1UkTwMRun4OkXs2zsdnEgU6z6LjMG8DBx",
     "kata_serapan"      : "1hNwi7pFTPk1XVCA3pCIhsmX5NM767Zky",
     "akronim"           : "1cyhIF4Gs1JyaTuFRAu4Jzw7uY_EbJ2Fx",
